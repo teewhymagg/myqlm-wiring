@@ -12,7 +12,7 @@ def load_graph(filepath):
     return data['nodes'], data['edges']
 
 class SimulatedAnnealingSolver:
-    def __init__(self, temp_max=100.0, temp_min=0.01, n_steps=20000, seed=42, n_restarts=5):
+    def __init__(self, temp_max=100.0, temp_min=0.001, n_steps=50000, seed=42, n_restarts=20):
         self.temp_max = temp_max
         self.temp_min = temp_min
         self.n_steps = n_steps
