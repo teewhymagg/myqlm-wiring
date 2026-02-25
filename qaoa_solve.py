@@ -6,8 +6,9 @@ import numpy as np
 
 from qubo_builder import RoutingQUBO
 from qat.opt import QUBO
-from qat.qpus import SimulatedAnnealing
-from qat.core import Variable
+from qat.plugins import ScipyMinimizePlugin
+from qat.qpus import PyLinalg
+from qat.core import Job
 
 
 def load_graph(filepath: str):
@@ -16,18 +17,12 @@ def load_graph(filepath: str):
     return data["nodes"], data["edges"]
 
 
-def bitstring_to_binary(bitstring: str) -> list[int]:
-    # myQLM Ising convention: '0' = spin+1 = x=1, '1' = spin-1 = x=0
-    return [1 - int(b) for b in bitstring]
-
-
 def qubo_energy(x, M: np.ndarray, offset: float) -> float:
     x = np.asarray(x, dtype=float)
     return float(x @ M @ x) + offset
 
 
 def greedy_descent(x: np.ndarray, M: np.ndarray, offset: float, rng=None):
-    # local descent: pick a random improving flip (or best-first if rng is None)
     x = np.array(x, dtype=int)
     e = qubo_energy(x, M, offset)
     while True:
@@ -50,7 +45,6 @@ def greedy_descent(x: np.ndarray, M: np.ndarray, offset: float, rng=None):
 
 
 def multi_greedy_descent(x: np.ndarray, M: np.ndarray, offset: float, n_attempts: int = 20, seed: int = 0):
-    # run greedy descent with random flip ordering, return best result across attempts
     best_x, best_e = greedy_descent(x, M, offset)
     rng = np.random.default_rng(seed)
     for _ in range(n_attempts - 1):
@@ -62,7 +56,6 @@ def multi_greedy_descent(x: np.ndarray, M: np.ndarray, offset: float, n_attempts
 
 
 def remove_back_forth_pairs(x: np.ndarray, builder: RoutingQUBO) -> np.ndarray:
-    # zero out any (u->v, v->u) pairs that are both active
     x = x.copy()
     changed = True
     while changed:
@@ -92,49 +85,76 @@ def is_valid_simple_path(path: list[tuple], source: str, dest: str) -> bool:
     return True
 
 
-def solve_with_myqlm_sa(
+def decode_state(state_int: int, n_vars: int) -> np.ndarray:
+    # QAOA uses MSB ordering: qubit 0 is the most significant bit
+    return np.array([(state_int >> (n_vars - 1 - i)) & 1 for i in range(n_vars)], dtype=int)
+
+
+def solve_with_myqlm_qaoa(
     nodes: list[str],
     edges: list[dict],
     source: str,
     dest: str,
     *,
     penalty: float = 15.0,
-    n_steps: int = 5000,
-    n_restarts: int = 30,
-    temp_max: float = 50.0,
-    temp_min: float = 0.1,
-    seed_base: int = 0,
+    depth: int = 2,
+    n_optimizer_steps: int = 20,
+    n_samples: int = 200,
+    n_greedy_attempts: int = 20,
+    seed: int = 0,
 ):
     builder = RoutingQUBO(nodes, edges, source, dest, penalty_weight=penalty)
     M, offset = builder.build_qubo()
+    n = builder.num_vars
 
-    # myQLM minimises H = -x^T Q x - E_Q; our objective is x^T M x + offset
+    # myQLM minimises H = -x^T Q x - E_Q
     qubo_problem = QUBO(Q=-M, offset_q=-offset)
-
-    t = Variable("t", float)
-    temp_t = temp_max * (1.0 - t) + temp_min * t
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        job = qubo_problem.to_job()
+        job = qubo_problem.qaoa_ansatz(depth=depth, cnots=False)
 
+    # partially optimize variational parameters (full convergence is slow for 16 qubits)
+    plugin = ScipyMinimizePlugin(
+        method="COBYLA",
+        tol=1e-2,
+        options={"maxiter": n_optimizer_steps},
+    )
+
+    print(f"optimizing QAOA parameters ({n_optimizer_steps} steps, depth={depth})...")
+    t0 = time.time()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        opt_result = (plugin | PyLinalg()).submit(job)
+
+    print(f"done in {time.time() - t0:.1f}s  expectation={opt_result.value:.3f}")
+
+    # bind optimal parameters and sample the circuit
+    optimal_params = {k: v.real for k, v in opt_result.parameter_map.items()}
+    bound_circuit = job.circuit(**optimal_params)
+    sampling_job = Job(circuit=bound_circuit, nbshots=n_samples)
+
+    print(f"sampling {n_samples} shots...")
+    t1 = time.time()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        sample_result = PyLinalg().submit(sampling_job)
+    print(f"done in {time.time() - t1:.1f}s")
+
+    # post-process each sample with multi-greedy descent + cycle removal
     best_energy = float("inf")
     best_path = None
     best_cost = float("inf")
 
-    start_time = time.time()
+    rng = np.random.default_rng(seed)
+    for idx, s in enumerate(sample_result.raw_data):
+        x = decode_state(s.state.int, n)
 
-    for restart in range(n_restarts):
-        qpu = SimulatedAnnealing(temp_t=temp_t, n_steps=n_steps, seed=seed_base + restart)
-        result = qpu.submit(job)
+        xg, _ = multi_greedy_descent(x, M, offset, n_attempts=n_greedy_attempts, seed=int(rng.integers(1 << 31)))
+        xc = remove_back_forth_pairs(xg, builder)
+        xc, e_final = multi_greedy_descent(xc, M, offset, n_attempts=n_greedy_attempts, seed=int(rng.integers(1 << 31)))
 
-        binary_sa = np.array(bitstring_to_binary(result.raw_data[0].state.bitstring), dtype=int)
-
-        binary_gd, _ = multi_greedy_descent(binary_sa, M, offset, n_attempts=30, seed=seed_base + restart)
-        binary_clean = remove_back_forth_pairs(binary_gd, builder)
-        binary_clean, e_final = multi_greedy_descent(binary_clean, M, offset, n_attempts=30, seed=seed_base + restart + 1000)
-
-        path, cost = builder.decode(binary_clean.tolist())
+        path, cost = builder.decode(xc.tolist())
         valid = is_valid_simple_path(path, source, dest)
 
         if valid and e_final < best_energy:
@@ -142,8 +162,8 @@ def solve_with_myqlm_sa(
             best_path = path
             best_cost = cost
 
-    elapsed = time.time() - start_time
-    print(f"done in {elapsed:.2f}s")
+    elapsed = time.time() - t0
+    print(f"total: {elapsed:.1f}s")
 
     if best_path:
         route = " -> ".join([e[0] for e in best_path] + [best_path[-1][1]])
@@ -151,7 +171,7 @@ def solve_with_myqlm_sa(
         print(f"cost:   {best_cost:.4f} m")
         print(f"energy: {best_energy:.4f}")
     else:
-        print("no valid path found, try increasing n_restarts or adjusting penalty")
+        print("no valid path found, try increasing n_samples or n_greedy_attempts")
 
     return best_path, best_cost, best_path is not None
 
@@ -159,13 +179,13 @@ def solve_with_myqlm_sa(
 if __name__ == "__main__":
     nodes, edges = load_graph("graph.json")
 
-    solve_with_myqlm_sa(
+    solve_with_myqlm_qaoa(
         nodes, edges,
         source="A",
         dest="F",
         penalty=15.0,
-        n_steps=5000,
-        n_restarts=30,
-        temp_max=50.0,
-        temp_min=0.1,
+        depth=2,
+        n_optimizer_steps=20,
+        n_samples=200,
+        n_greedy_attempts=20,
     )
